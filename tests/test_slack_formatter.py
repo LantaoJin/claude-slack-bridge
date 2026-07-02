@@ -1,14 +1,17 @@
 import json
 
 from claude_slack_bridge.slack_formatter import (
+    QUESTION_ACTION_PREFIX,
     build_approval_blocks,
     build_approval_resolved_blocks,
     build_options_blocks,
     build_post_tool_blocks,
+    build_question_blocks,
     build_response_blocks,
     build_session_header_blocks,
     build_user_prompt_blocks,
     extract_options,
+    extract_question_options,
     md_to_mrkdwn,
     split_message,
     strip_thinking_tags,
@@ -304,6 +307,74 @@ def test_build_options_blocks_exactly_75_chars_no_fallback() -> None:
     assert len(blocks) == 1
     assert blocks[0]["type"] == "actions"
     assert blocks[0]["elements"][0]["text"]["text"] == choice
+
+
+# ── AskUserQuestion: extract_question_options + build_question_blocks ──
+
+
+def test_extract_question_options_basic() -> None:
+    """Reads the first question's header/question and option labels."""
+    tool_input = {
+        "questions": [
+            {
+                "header": "Database",
+                "question": "Which database should we use?",
+                "options": [
+                    {"label": "Postgres", "description": "relational"},
+                    {"label": "MySQL", "description": "relational"},
+                    {"label": "SQLite", "description": "embedded"},
+                ],
+            }
+        ]
+    }
+    prompt, options = extract_question_options(tool_input)
+    assert "Database" in prompt
+    assert "Which database should we use?" in prompt
+    assert options == ["Postgres", "MySQL", "SQLite"]
+
+
+def test_extract_question_options_tolerates_missing_and_bare_strings() -> None:
+    """Missing header/description and bare-string options are handled."""
+    tool_input = {"questions": [{"question": "Pick one", "options": ["A", {"label": "B"}]}]}
+    prompt, options = extract_question_options(tool_input)
+    assert prompt == "Pick one"
+    assert options == ["A", "B"]
+
+
+def test_extract_question_options_empty_returns_no_options() -> None:
+    """Malformed / empty input yields no options so caller can fall back."""
+    for bad in ({}, {"questions": []}, {"questions": [{}]}, "not a dict", None):
+        prompt, options = extract_question_options(bad)
+        assert options == []
+
+
+def test_build_question_blocks_numbered_buttons() -> None:
+    """Buttons are labeled 1..N; a section lists the full option text; the
+    number lives in the action_id and value carries only the raw label (Slack
+    normalizes whitespace in round-tripped values, so no packed delimiter)."""
+    blocks = build_question_blocks("Which DB?", ["Postgres", "MySQL"])
+    assert blocks[0]["type"] == "section"
+    section = blocks[0]["text"]["text"]
+    assert "Which DB?" in section
+    assert "*1.* Postgres" in section
+    assert "*2.* MySQL" in section
+
+    buttons = blocks[1]["elements"]
+    assert [b["text"]["text"] for b in buttons] == ["1", "2"]
+    assert [b["action_id"] for b in buttons] == [
+        f"{QUESTION_ACTION_PREFIX}0", f"{QUESTION_ACTION_PREFIX}1"
+    ]
+    # value = raw label only (no number prefix, no delimiter)
+    assert buttons[0]["value"] == "Postgres"
+    assert buttons[1]["value"] == "MySQL"
+
+
+def test_build_question_blocks_caps_at_nine() -> None:
+    """At most 9 options so single-key selection stays unambiguous."""
+    blocks = build_question_blocks("many", [f"opt{i}" for i in range(12)])
+    buttons = blocks[1]["elements"]
+    assert len(buttons) == 9
+    assert buttons[-1]["text"]["text"] == "9"
 
 
 # ── New tests: build_approval_resolved_blocks ──

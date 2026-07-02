@@ -12,6 +12,10 @@ CONTINUATION = "\n\n_(continued...)_"
 
 _OPTIONS_RE = re.compile(r"\[OPTIONS:\s*(.+?)\]\s*$", re.MULTILINE)
 OPTIONS_ACTION_PREFIX = "options_choice_"
+# Numbered buttons for the AskUserQuestion tool (Claude asking the user to
+# pick an option). Distinct from OPTIONS_ACTION_PREFIX so the click handler
+# can route AskUserQuestion picks differently (number → TUI dialog).
+QUESTION_ACTION_PREFIX = "question_choice_"
 
 # ── Markdown → Slack mrkdwn patterns ──
 
@@ -270,6 +274,73 @@ def build_options_blocks(choices: list[str]) -> list[dict]:
     ]
     blocks.append({"type": "actions", "elements": buttons})
     return blocks
+
+
+def extract_question_options(tool_input: dict) -> tuple[str, list[str]]:
+    """Parse an AskUserQuestion tool_input into (prompt_text, option_labels).
+
+    AskUserQuestion's schema (from the tool definition) is:
+        {"questions": [{"question": str, "header": str,
+                        "options": [{"label": str, "description": str}, ...]}]}
+    The schema is not part of the published hooks docs, so this parses
+    defensively: it reads the FIRST question (the bridge surfaces one question
+    at a time), tolerates missing fields, accepts option entries that are
+    either dicts or bare strings, and returns ("", []) when nothing usable is
+    found so the caller can fall back to plain approval handling.
+    """
+    if not isinstance(tool_input, dict):
+        return "", []
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return "", []
+    q = questions[0]
+    if not isinstance(q, dict):
+        return "", []
+
+    header = str(q.get("header", "")).strip()
+    question = str(q.get("question", "")).strip()
+    parts = [p for p in (header, question) if p]
+    prompt = "\n".join(parts) if parts else "Choose an option"
+
+    labels: list[str] = []
+    for opt in q.get("options", []) or []:
+        if isinstance(opt, dict):
+            label = str(opt.get("label", "")).strip()
+        else:
+            label = str(opt).strip()
+        if label:
+            labels.append(label)
+    return prompt, labels
+
+
+def build_question_blocks(prompt: str, options: list[str]) -> list[dict]:
+    """Render AskUserQuestion options as numbered Slack buttons (1, 2, 3, …).
+
+    The button *labels* are the numbers so the picker stays compact even for
+    long option text; a section block lists "1. <full text>" above them. The
+    number is encoded in the ``action_id`` (``question_choice_<i>``) so the
+    click handler derives it there — ``value`` carries only the raw label. (We
+    deliberately do NOT pack "number<sep>label" into value: Slack round-trips
+    button values with whitespace normalized, so a tab/space delimiter is
+    unreliable — the label itself can contain spaces.)
+    """
+    options = options[:9]  # 1–9 keeps single-key selection unambiguous
+    listing = "\n".join(f"*{i + 1}.* {opt}" for i, opt in enumerate(options))
+    text = f"{prompt}\n\n{listing}" if prompt else listing
+
+    buttons = [
+        {
+            "type": "button",
+            "text": {"type": "plain_text", "text": str(i + 1)},
+            "action_id": f"{QUESTION_ACTION_PREFIX}{i}",
+            "value": opt,
+        }
+        for i, opt in enumerate(options)
+    ]
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text[:SLACK_MAX_TEXT]}},
+        {"type": "actions", "elements": buttons},
+    ]
 
 
 def truncate_text(text: str, max_chars: int) -> str:

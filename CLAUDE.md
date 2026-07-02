@@ -56,6 +56,8 @@ All three feed into the `SessionManager` which tracks the PROCESS/HOOK/IDLE stat
 - **Plain text over blocks**: Final responses use the `text` field (not Block Kit) to avoid Slack's "See more" truncation.
 - **Loop prevention**: `CLAUDE_SLACK_BRIDGE_PRINT=1` env var is set on `--print` subprocesses so hooks skip when called from the daemon's own processes.
 - **OPTIONS extraction**: Claude can include `[OPTIONS: A | B | C]` in responses, which get parsed and rendered as clickable Slack buttons.
+- **bypassPermissions passthrough**: The hook forwards the session's `permission_mode`. When it is `bypassPermissions`, PreToolUse/PermissionRequest auto-approve silently — no Approve/Trust/YOLO/Reject buttons — since the user opted out of tool approvals.
+- **AskUserQuestion buttons**: When Claude calls the `AskUserQuestion` tool (a question, not a permission gate), the daemon posts numbered Slack buttons (1, 2, 3…) instead of approval buttons, and works even under bypassPermissions. A click routes the pick back: the bare number via tmux to a synced TUI (matching the native dialog's key selection), or the full option text to a PROCESS session. Action prefix `question_choice_`; parsing/rendering in `extract_question_options`/`build_question_blocks`.
 
 ### Two session tracking systems
 
@@ -78,8 +80,8 @@ queued(eyes) → thinking(thinking_face) → coding(technologist) → browsing(g
 ### Hook pipeline (plugins/slack-bridge/hooks/hooks.json)
 
 Hooks are registered via the plugin's `hooks.json` (10 event types). The hook script `bin/claude-slack-bridge-hook` uses **stdlib urllib only** (no aiohttp) to POST to the daemon. Key hooks:
-- **PreToolUse** — fire-and-forget, auto-approves for TUI sessions (no Slack blocking)
-- **PermissionRequest** — blocks waiting for Slack approval buttons (Approve/Trust/YOLO/Reject). Replaces TUI's built-in approval dialog. Falls through to TUI prompt on timeout.
+- **PreToolUse** — fire-and-forget, auto-approves for TUI sessions (no Slack blocking). Also forwards `permission_mode` and short-circuits two cases: `AskUserQuestion` → numbered choice buttons; `bypassPermissions` → silent auto-approve.
+- **PermissionRequest** — blocks waiting for Slack approval buttons (Approve/Trust/YOLO/Reject). Replaces TUI's built-in approval dialog. Falls through to TUI prompt on timeout. Auto-approves without buttons under `bypassPermissions`.
 - **PostToolUse** — fire-and-forget, updates tool status in progress message + phase-aware reaction
 - **UserPromptSubmit** — fire-and-forget, syncs TUI-typed prompts to Slack (Slack-forwarded prompts filtered)
 - **Stop** — reads JSONL file for full turn content, posts final response to Slack

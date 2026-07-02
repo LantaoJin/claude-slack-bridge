@@ -16,6 +16,7 @@ from claude_slack_bridge.reactions import StatusReactionController
 from claude_slack_bridge.session_manager import SessionMode
 from claude_slack_bridge.slack_formatter import (
     OPTIONS_ACTION_PREFIX,
+    QUESTION_ACTION_PREFIX,
     build_approval_resolved_blocks,
     build_session_header_blocks,
 )
@@ -297,6 +298,30 @@ class EventsMixin:
                             )
                         except Exception:
                             logger.warning("Failed to update options message", exc_info=True)
+        elif action_id.startswith(QUESTION_ACTION_PREFIX):
+            # AskUserQuestion pick. The 0-based index is in the action_id
+            # (question_choice_<i>); value is the raw label. We derive the
+            # 1-based number from the index rather than parsing value, because
+            # Slack normalizes whitespace in round-tripped button values (so a
+            # packed "number<sep>label" delimiter is unreliable).
+            label = value
+            try:
+                number = str(int(action_id[len(QUESTION_ACTION_PREFIX):]) + 1)
+            except ValueError:
+                number = "1"
+            thread_ts = msg.get("thread_ts", msg_ts)
+            if channel_id and thread_ts:
+                session = self._session_mgr.find_by_thread(channel_id, thread_ts)
+                if session:
+                    await self._deliver_question_choice(session, number, label)
+                    if self._slack and msg_ts:
+                        try:
+                            await self._slack.web.chat_update(
+                                channel=channel_id, ts=msg_ts,
+                                text=f"\u2705 Selected *{number}.* {label}", blocks=[],
+                            )
+                        except Exception:
+                            logger.warning("Failed to update question message", exc_info=True)
         elif action_id == "trust_tool":
             # "Trust" = tell CC to persist an allow rule (equivalent to
             # the TUI's "Yes, don't ask again"). The hook script will
@@ -353,3 +378,25 @@ class EventsMixin:
                         )
                     except Exception:
                         logger.warning("Failed to update takeover message", exc_info=True)
+
+    async def _deliver_question_choice(
+        self, session, number: str, label: str
+    ) -> None:
+        """Deliver an AskUserQuestion pick back to the session.
+
+        A synced TUI session is blocked on Claude Code's native question dialog,
+        which selects by number key \u2014 so send the bare number via tmux. A
+        Slack-started PROCESS session (or a TUI whose pane is gone) has no such
+        dialog, so feed it the full option text as its next input.
+        """
+        if session.mode != SessionMode.PROCESS.value and session.origin == "tui":
+            sent = await send_message_to_session(number, pane_id=session.tmux_pane_id)
+            if sent:
+                # The TUI will echo this pick via UserPromptSubmit; suppress it.
+                if len(self._forwarded_prompts) >= 50:
+                    self._forwarded_prompts.clear()
+                self._forwarded_prompts.add(number.strip())
+                return
+            # Pane gone \u2014 fall back to feeding the full text to --print.
+            session.origin = "slack"
+        await self._resume_process(session, label)

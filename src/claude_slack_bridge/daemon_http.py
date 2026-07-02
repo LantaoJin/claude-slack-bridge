@@ -22,9 +22,22 @@ from claude_slack_bridge.slack_formatter import (
     SLACK_MSG_LIMIT,
     build_approval_blocks,
     build_approval_resolved_blocks,
+    build_question_blocks,
     build_tool_notification_blocks,
     build_user_prompt_blocks,
+    extract_question_options,
 )
+
+# permission_mode value (forwarded by the hook) meaning the TUI was launched
+# with --permission-mode bypassPermissions. In this mode the user has opted out
+# of tool approvals entirely, so the daemon must not post Approve/Trust/YOLO/
+# Reject buttons — it auto-approves and stays silent on permission gates.
+BYPASS_PERMISSIONS = "bypassPermissions"
+
+# Tools that are interactive questions, not permission gates. These surface as
+# numbered choice buttons in Slack even under bypassPermissions (they need no
+# permission, so Claude Code fires PreToolUse for them regardless of mode).
+QUESTION_TOOL = "AskUserQuestion"
 
 _SLACK_MAX_TEXT = SLACK_MSG_LIMIT
 
@@ -205,6 +218,26 @@ async def _echo_user_prompt(daemon, session, payload) -> None:
         f"\U0001f4ac *User:* {user_text[:3000]}",
         session.thread_ts,
     )
+
+
+async def _post_question_buttons(daemon, session, tool_input) -> bool:
+    """Post AskUserQuestion options as numbered Slack buttons.
+
+    Returns True if buttons were posted (caller should auto-approve the tool so
+    the TUI's native question dialog stays open for the pick to land on), False
+    if the tool_input had no usable options (caller handles it as a normal tool).
+    The picked option is delivered back by the interactive click handler.
+    """
+    prompt, options = extract_question_options(tool_input)
+    if not options:
+        logger.info("AskUserQuestion had no parseable options; input=%r", tool_input)
+        return False
+    await daemon._seal_progress(session)
+    blocks = build_question_blocks(prompt, options)
+    await daemon._slack.post_blocks(
+        session.channel_id, blocks, "Claude is asking a question", session.thread_ts,
+    )
+    return True
 
 
 async def _post_final_answer(daemon, session, payload, last_only: bool = False) -> None:
@@ -395,6 +428,26 @@ def create_http_app(daemon) -> web.Application:
         if hook_type == "pre-tool-use":
             tool_name = payload.get("tool_name", "")
             tool_input = payload.get("tool_input", {})
+            permission_mode = payload.get("permission_mode", "")
+
+            # AskUserQuestion is a question, not a permission gate: surface it as
+            # numbered choice buttons in Slack. pre-tool-use fires in EVERY
+            # permission mode (including bypassPermissions), so this is the one
+            # place guaranteed to see the question — permission-request may not
+            # fire under bypass. Gate on is_fully_muted (not is_silenced): summary
+            # and ring are "silenced" for chatter but still interact via Slack, so
+            # questions should appear there too. Fully-muted → TUI dialog only.
+            if (
+                tool_name == QUESTION_TOOL
+                and daemon._slack
+                and session
+                and not daemon.is_fully_muted(session.session_id)
+            ):
+                if await daemon._ensure_slack_thread(session):
+                    await _post_question_buttons(daemon, session, tool_input)
+                # Auto-approve either way: the pick lands via the click handler,
+                # and blocking here would freeze the TUI's native question UI.
+                return web.Response(text="approved")
 
             # Fast-path: YOLO / trusted session (per-session auto-allow)
             if session and session.session_id in daemon._trusted_sessions:
@@ -402,6 +455,11 @@ def create_http_app(daemon) -> web.Application:
 
             # Fast-path: safe tools (Read, Glob, Grep by default)
             if tool_name in daemon._config.auto_approve_tools:
+                return web.Response(text="approved")
+
+            # bypassPermissions: the user opted out of tool approvals. Never post
+            # Approve/Trust/YOLO/Reject buttons — just auto-approve silently.
+            if permission_mode == BYPASS_PERMISSIONS:
                 return web.Response(text="approved")
 
             # Unbound TUI sessions or missing Slack: auto-approve. Lazy bind
@@ -716,12 +774,23 @@ def create_http_app(daemon) -> web.Application:
 
         session = daemon._session_mgr.get(session_key)
 
+        # AskUserQuestion also fires permission-request (empirically — it is not
+        # a no-permission tool). The numbered choice buttons are already posted
+        # from the pre-tool-use hook, which fires first; auto-approve here so we
+        # DON'T also post Approve/Trust/YOLO/Reject buttons on top of them.
+        if tool_name == QUESTION_TOOL:
+            return web.Response(text="approved")
+
         # Fast-path: YOLO / trusted session
         if session and session.session_id in daemon._trusted_sessions:
             return web.Response(text="approved")
 
         # Fast-path: safe tools
         if tool_name in daemon._config.auto_approve_tools:
+            return web.Response(text="approved")
+
+        # bypassPermissions: user opted out of approvals — auto-approve, no buttons.
+        if payload.get("permission_mode", "") == BYPASS_PERMISSIONS:
             return web.Response(text="approved")
 
         if not daemon._slack:

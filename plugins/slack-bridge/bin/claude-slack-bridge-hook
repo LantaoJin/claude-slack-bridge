@@ -83,6 +83,10 @@ def build_payload(event_type, stdin_json):
         payload["tool_name"] = stdin_json.get("tool_name", "")
         payload["tool_input"] = stdin_json.get("tool_input", {})
         payload["tool_use_id"] = stdin_json.get("tool_use_id", "")
+        # Session permission mode ("default"/"acceptEdits"/"bypassPermissions"/
+        # "plan"/…). Present on tool-use hook events; lets the daemon skip Slack
+        # approval prompts entirely when the user launched with bypassPermissions.
+        payload["permission_mode"] = stdin_json.get("permission_mode", "")
     if event_type == "post-tool-use":
         payload["tool_output"] = stdin_json.get("tool_output", "")
         payload["duration_ms"] = stdin_json.get("duration_ms", 0)

@@ -1787,3 +1787,266 @@ async def test_summary_mute_skips_forwarded_and_system_prompts(config: BridgeCon
 
     # Neither the forwarded echo nor the system message reaches Slack.
     daemon._slack.post_text.assert_not_awaited()
+
+
+# ── bypassPermissions: no approval buttons ──
+
+
+async def test_pre_tool_use_bypass_mode_no_approval_buttons(config: BridgeConfig) -> None:
+    """PROCESS session under bypassPermissions auto-approves without posting
+    Approve/Trust/YOLO/Reject buttons."""
+    daemon = Daemon(config)
+    _mock_slack_for_lazy_bind(daemon)
+    daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.PROCESS,
+    )
+
+    app = create_http_app(daemon)
+    from aiohttp.test_utils import TestServer, TestClient
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/hooks/pre-tool-use", json={
+            "session_key": "s1", "tool_name": "Bash",
+            "tool_input": {"command": "rm file"}, "cwd": "/tmp",
+            "permission_mode": "bypassPermissions",
+        })
+        assert resp.status == 200
+        assert (await resp.text()) == "approved"
+
+    # No approval card posted.
+    daemon._slack.post_blocks.assert_not_awaited()
+
+
+async def test_permission_request_bypass_mode_auto_approves(config: BridgeConfig) -> None:
+    """PermissionRequest under bypassPermissions auto-approves, no Slack buttons."""
+    daemon = Daemon(config)
+    _mock_slack_for_lazy_bind(daemon)
+    daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.HOOK,
+    )
+    daemon.set_mute_level("s1", "sync")  # opted in — would normally post buttons
+
+    app = create_http_app(daemon)
+    from aiohttp.test_utils import TestServer, TestClient
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/hooks/permission-request", json={
+            "session_key": "s1", "tool_name": "Bash",
+            "tool_input": {"command": "rm file"}, "cwd": "/tmp",
+            "permission_mode": "bypassPermissions",
+        })
+        assert resp.status == 200
+        assert (await resp.text()) == "approved"
+
+    daemon._slack.post_blocks.assert_not_awaited()
+
+
+# ── AskUserQuestion: numbered choice buttons ──
+
+
+async def test_pre_tool_use_ask_user_question_posts_numbered_buttons(
+    config: BridgeConfig,
+) -> None:
+    """AskUserQuestion under SUMMARY mode posts numbered buttons and
+    auto-approves. Regression: summary is is_silenced()==True, so gating the
+    question branch on is_silenced wrongly skipped it — the correct gate is
+    is_fully_muted (summary/ring still interact via Slack)."""
+    daemon = Daemon(config)
+    _mock_slack_for_lazy_bind(daemon)
+    daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.HOOK,
+    )
+    daemon.set_mute_level("s1", "summary")
+
+    app = create_http_app(daemon)
+    from aiohttp.test_utils import TestServer, TestClient
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/hooks/pre-tool-use", json={
+            "session_key": "s1", "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{
+                "header": "Database", "question": "Which DB?",
+                "options": [{"label": "Postgres"}, {"label": "MySQL"}],
+            }]},
+            "cwd": "/tmp", "permission_mode": "default",
+        })
+        assert resp.status == 200
+        # Auto-approved so the TUI dialog isn't blocked.
+        assert (await resp.text()) == "approved"
+
+    # Numbered buttons were posted.
+    daemon._slack.post_blocks.assert_awaited()
+    blocks = daemon._slack.post_blocks.await_args.args[1]
+    buttons = blocks[-1]["elements"]
+    assert [b["text"]["text"] for b in buttons] == ["1", "2"]
+
+
+async def test_permission_request_ask_user_question_no_approval_buttons(
+    config: BridgeConfig,
+) -> None:
+    """AskUserQuestion also fires permission-request (empirically). It must
+    auto-approve WITHOUT posting Approve/Trust/YOLO/Reject — the numbered
+    buttons already came from the pre-tool-use hook."""
+    daemon = Daemon(config)
+    _mock_slack_for_lazy_bind(daemon)
+    daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.HOOK,
+    )
+    daemon.set_mute_level("s1", "summary")
+
+    app = create_http_app(daemon)
+    from aiohttp.test_utils import TestServer, TestClient
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/hooks/permission-request", json={
+            "session_key": "s1", "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "Which DB?",
+                                          "options": [{"label": "Postgres"}]}]},
+            "cwd": "/tmp", "permission_mode": "default",
+        })
+        assert resp.status == 200
+        assert (await resp.text()) == "approved"
+
+    # No approval buttons posted from the permission-request path.
+    daemon._slack.post_blocks.assert_not_awaited()
+
+
+async def test_pre_tool_use_ask_user_question_even_under_bypass(
+    config: BridgeConfig,
+) -> None:
+    """AskUserQuestion still surfaces as buttons under bypassPermissions — it's a
+    question, not a permission gate."""
+    daemon = Daemon(config)
+    _mock_slack_for_lazy_bind(daemon)
+    daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.HOOK,
+    )
+    daemon.set_mute_level("s1", "sync")
+
+    app = create_http_app(daemon)
+    from aiohttp.test_utils import TestServer, TestClient
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/hooks/pre-tool-use", json={
+            "session_key": "s1", "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "Pick", "options": ["A", "B"]}]},
+            "cwd": "/tmp", "permission_mode": "bypassPermissions",
+        })
+        assert resp.status == 200
+        assert (await resp.text()) == "approved"
+
+    daemon._slack.post_blocks.assert_awaited()
+
+
+async def test_ask_user_question_no_options_falls_through(config: BridgeConfig) -> None:
+    """AskUserQuestion with unparseable input posts no buttons but still approves."""
+    daemon = Daemon(config)
+    _mock_slack_for_lazy_bind(daemon)
+    daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.HOOK,
+    )
+    daemon.set_mute_level("s1", "sync")
+
+    app = create_http_app(daemon)
+    from aiohttp.test_utils import TestServer, TestClient
+
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post("/hooks/pre-tool-use", json={
+            "session_key": "s1", "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{"question": "?", "options": []}]},
+            "cwd": "/tmp", "permission_mode": "default",
+        })
+        assert resp.status == 200
+        assert (await resp.text()) == "approved"
+
+    # No usable options → no buttons posted.
+    daemon._slack.post_blocks.assert_not_awaited()
+
+
+async def test_deliver_question_choice_tui_sends_number_via_tmux(
+    config: BridgeConfig,
+) -> None:
+    """TUI (hook, origin=tui) session: the pick is delivered as the bare number
+    over tmux (matching the native dialog's number-key selection)."""
+    daemon = Daemon(config)
+    daemon._slack = MagicMock()
+    session = daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.HOOK,
+    )
+    session.origin = "tui"
+    session.tmux_pane_id = "%7"
+
+    with patch(
+        "claude_slack_bridge.daemon_events.send_message_to_session",
+        new=AsyncMock(return_value=True),
+    ) as send_mock:
+        await daemon._deliver_question_choice(session, "2", "MySQL")
+
+    send_mock.assert_awaited_once()
+    # Bare number sent to the pane, not the label.
+    assert send_mock.await_args.args[0] == "2"
+    assert send_mock.await_args.kwargs["pane_id"] == "%7"
+    # Echo of that number is suppressed on the way back.
+    assert "2" in daemon._forwarded_prompts
+
+
+async def test_deliver_question_choice_process_sends_full_text(
+    config: BridgeConfig,
+) -> None:
+    """PROCESS session has no native dialog: the pick is fed as the full option
+    text to the resumed process."""
+    daemon = Daemon(config)
+    daemon._slack = MagicMock()
+    session = daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.PROCESS,
+    )
+
+    with patch.object(daemon, "_resume_process", new=AsyncMock()) as resume_mock:
+        await daemon._deliver_question_choice(session, "2", "MySQL")
+
+    resume_mock.assert_awaited_once()
+    assert resume_mock.await_args.args[1] == "MySQL"
+
+
+async def test_question_choice_click_derives_number_from_action_id(
+    config: BridgeConfig,
+) -> None:
+    """Regression: the choice number must come from the action_id index, NOT
+    from parsing the button value. Slack normalizes whitespace in round-tripped
+    values, so a value like 'PostgreSQL' (or a multi-word label) must still send
+    the bare number '1' to a TUI dialog — never '1 PostgreSQL'."""
+    daemon = Daemon(config)
+    daemon._slack = MagicMock()
+    daemon._slack.web = MagicMock()
+    daemon._slack.web.chat_update = AsyncMock()
+    session = daemon._session_mgr.create(
+        session_id="s1", session_name="t", channel_id="D1", thread_ts="ts.root",
+        mode=SessionMode.HOOK,
+    )
+    session.origin = "tui"
+    session.tmux_pane_id = "%4"
+
+    with patch(
+        "claude_slack_bridge.daemon_events.send_message_to_session",
+        new=AsyncMock(return_value=True),
+    ) as send_mock:
+        await daemon._handle_interactive(
+            # action_id index 0 → number "1"; value is the raw (multi-word) label
+            action={"action_id": "question_choice_0", "value": "PostgreSQL is great"},
+            payload={
+                "channel": {"id": "D1"},
+                "message": {"ts": "m.1", "thread_ts": "ts.root"},
+            },
+        )
+
+    send_mock.assert_awaited_once()
+    # Bare number derived from action_id — NOT "1 PostgreSQL is great".
+    assert send_mock.await_args.args[0] == "1"
